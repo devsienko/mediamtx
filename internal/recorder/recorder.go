@@ -37,7 +37,8 @@ type Recorder struct {
 
 	currentInstance *recorderInstance
 
-	terminate chan struct{}
+	terminate chan bool
+	flush     chan chan struct{}
 	done      chan struct{}
 }
 
@@ -58,7 +59,8 @@ func (r *Recorder) Initialize() {
 		r.location = time.Local
 	}
 
-	r.terminate = make(chan struct{})
+	r.terminate = make(chan bool)
+	r.flush = make(chan chan struct{})
 	r.done = make(chan struct{})
 
 	r.currentInstance = &recorderInstance{
@@ -87,8 +89,36 @@ func (r *Recorder) Log(level logger.Level, format string, args ...any) {
 // Close closes the agent.
 func (r *Recorder) Close() {
 	r.Log(logger.Info, "recording stopped")
-	close(r.terminate)
+	select {
+	case r.terminate <- false:
+	case <-r.done:
+	}
 	<-r.done
+}
+
+// CloseGracefully closes the recorder after processing all queued units.
+func (r *Recorder) CloseGracefully() {
+	r.Log(logger.Info, "recording stopped")
+	select {
+	case r.terminate <- true:
+	case <-r.done:
+	}
+	<-r.done
+}
+
+// Flush waits until all units currently queued by the stream have been processed.
+func (r *Recorder) Flush() {
+	done := make(chan struct{})
+	select {
+	case r.flush <- done:
+	case <-r.done:
+		return
+	}
+
+	select {
+	case <-done:
+	case <-r.done:
+	}
 }
 
 func (r *Recorder) run() {
@@ -97,16 +127,33 @@ func (r *Recorder) run() {
 	for {
 		select {
 		case <-r.currentInstance.done:
-			r.currentInstance.close()
-		case <-r.terminate:
-			r.currentInstance.close()
+			r.currentInstance.close(false)
+		case gracefully := <-r.terminate:
+			r.currentInstance.close(gracefully)
 			return
+		case done := <-r.flush:
+			r.currentInstance.flush()
+			close(done)
+			continue
 		}
 
-		select {
-		case <-time.After(r.restartPause):
-		case <-r.terminate:
-			return
+		timer := time.NewTimer(r.restartPause)
+	waitRestart:
+		for {
+			select {
+			case <-timer.C:
+				break waitRestart
+			case <-r.terminate:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case done := <-r.flush:
+				close(done)
+			}
 		}
 
 		r.currentInstance = &recorderInstance{

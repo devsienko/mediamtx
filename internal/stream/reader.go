@@ -2,6 +2,7 @@ package stream
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
@@ -24,6 +25,7 @@ type Reader struct {
 	queueSize               int
 	buffer                  *ringbuffer.RingBuffer
 	outboundFramesDiscarded *counterdumper.Dumper
+	runDone                 chan struct{}
 
 	// out
 	err chan error
@@ -80,7 +82,10 @@ func (r *Reader) Error() chan error {
 func (r *Reader) start() {
 	buffer, _ := ringbuffer.New(uint64(r.queueSize))
 	r.buffer = buffer
-	r.err = make(chan error)
+	// Keep this buffered so that the worker can always publish its terminal
+	// error and close runDone, even when nobody is currently receiving Error().
+	r.err = make(chan error, 1)
+	r.runDone = make(chan struct{})
 
 	r.outboundFramesDiscarded = &counterdumper.Dumper{
 		OnReport: func(val uint64) {
@@ -108,6 +113,7 @@ func (r *Reader) stop() {
 func (r *Reader) run() {
 	r.err <- r.runInner()
 	close(r.err)
+	close(r.runDone)
 }
 
 func (r *Reader) runInner() error {
@@ -128,5 +134,36 @@ func (r *Reader) push(cb func() error) {
 	ok := r.buffer.Push(cb)
 	if !ok {
 		r.outboundFramesDiscarded.Increase()
+	}
+}
+
+// WaitUntilEmpty waits until all data currently queued in the reader has been processed.
+func (r *Reader) WaitUntilEmpty() bool {
+	done := make(chan struct{})
+	barrier := func() error {
+		close(done)
+		return nil
+	}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if r.buffer.Push(barrier) {
+			break
+		}
+
+		select {
+		case <-r.runDone:
+			return false
+		case <-ticker.C:
+		}
+	}
+
+	select {
+	case <-done:
+		return true
+	case <-r.runDone:
+		return false
 	}
 }

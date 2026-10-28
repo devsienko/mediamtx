@@ -1,6 +1,7 @@
 /tmp
 /binaries
 /coverage*.txt
+/recordings
 /api/*.html
 /internal/core/VERSION
 /internal/servers/hls/hls.min.js

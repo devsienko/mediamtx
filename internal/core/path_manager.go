@@ -25,6 +25,7 @@ func pathConfCanBeUpdated(oldPathConf *conf.Path, newPathConf *conf.Path) bool {
 	clone.Name = newPathConf.Name
 	clone.Regexp = newPathConf.Regexp
 	clone.Forward = newPathConf.Forward
+	clone.AlwaysAvailableRecorded = newPathConf.AlwaysAvailableRecorded
 
 	clone.Record = newPathConf.Record
 	clone.RecordPath = newPathConf.RecordPath
@@ -33,6 +34,10 @@ func pathConfCanBeUpdated(oldPathConf *conf.Path, newPathConf *conf.Path) bool {
 	clone.RecordMaxPartSize = newPathConf.RecordMaxPartSize
 	clone.RecordSegmentDuration = newPathConf.RecordSegmentDuration
 	clone.RecordDeleteAfter = newPathConf.RecordDeleteAfter
+	clone.ArchiveControl = newPathConf.ArchiveControl
+	clone.ArchiveControlUUID = newPathConf.ArchiveControlUUID
+	clone.ArchiveControlMaxAge = newPathConf.ArchiveControlMaxAge
+	clone.ArchiveControlMinRestartInterval = newPathConf.ArchiveControlMinRestartInterval
 
 	clone.RPICameraBrightness = newPathConf.RPICameraBrightness
 	clone.RPICameraContrast = newPathConf.RPICameraContrast

@@ -595,6 +595,18 @@ pathDefaults:
   # Set to 0s to disable automatic deletion.
   recordDeleteAfter: 1d
 
+  # Allow H264 SEI messages to start and stop recording.
+  # This must be explicitly enabled only on paths whose publishers are trusted.
+  archiveControl: false
+  # UUID of archive-control user_data_unregistered SEI messages.
+  archiveControlUUID: 8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021
+  # Maximum difference between command timestamp and server time.
+  # Set to 0s to disable timestamp freshness checks.
+  archiveControlMaxAge: 5m
+  # Minimum delay before a stopped SEI-controlled recording can be started again.
+  # Set to 0s to disable restart rate limiting.
+  archiveControlMinRestartInterval: 1s
+
   ###############################################
   # Default path settings -> Publisher source (when source is "publisher")
 

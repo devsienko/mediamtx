@@ -47,6 +47,47 @@ pathDefaults:
 
 All available recording parameters are listed in the [configuration file](../6-references/1-configuration-file.md).
 
+## Control recording from H264 SEI metadata
+
+This fork can start and stop the recorder from metadata embedded by a trusted
+H264 publisher. The feature is disabled by default and is configured per path:
+
+```yml
+paths:
+  test:
+    archiveControl: true
+    archiveControlUUID: 8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021
+    archiveControlMaxAge: 5m
+    archiveControlMinRestartInterval: 1s
+    recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f_%z
+```
+
+The publisher sends a dedicated H264 prefix SEI NAL unit with payload type 5
+(`user_data_unregistered`). Its payload is the configured 16-byte UUID followed
+by compact UTF-8 JSON:
+
+```json
+{"schema":"faceter.archive-control.v1","command":"archive.start","timestamp":"2026-10-28T10:11:12.345Z","sequence":1,"stream":"test"}
+```
+
+`command` is either `archive.start` or `archive.stop`. The timestamp must be
+RFC 3339 and fresh, the sequence must be non-zero and strictly increase during
+the current live publisher session, and `stream` must exactly match the path.
+Setting `archiveControlMaxAge` to `0s` disables only the freshness window; a
+valid timestamp remains required.
+
+Start is inclusive: the access unit containing `archive.start` is the first one
+recorded. Stop is exclusive: the access unit containing `archive.stop` is used
+to finalize the preceding sample and is not recorded. MediaMTX removes a
+recognized control SEI before recording and relaying the access unit, preventing
+command replay when an archive is published again. Only one control command is
+accepted per access unit.
+
+An SEI stop does not disable recording enabled with `record: true`. The UUID is
+a protocol identifier, not authentication; enable this feature only on paths
+with trusted, authenticated publishers. See the
+[test publisher](../../tools/rtsp_streamer/README.md) for a working sender.
+
 ## Remote upload
 
 To upload recordings to a remote location, you can use _MediaMTX_ together with [rclone](https://github.com/rclone/rclone), a command line tool that provides file synchronization capabilities with a huge variety of services (including S3, FTP, SMB, Google Drive):

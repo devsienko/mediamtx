@@ -523,9 +523,7 @@ func (s *Stream) AddReader(r *Reader) {
 	}
 }
 
-// RemoveReader removes a reader.
-// Used by all protocols except RTSP.
-func (s *Stream) RemoveReader(r *Reader) {
+func (s *Stream) detachReader(r *Reader) {
 	s.mutex.Lock()
 
 	for medi, formats := range r.onDatas {
@@ -540,7 +538,20 @@ func (s *Stream) RemoveReader(r *Reader) {
 	delete(s.readers, r)
 
 	s.mutex.Unlock()
+}
 
+// RemoveReader removes a reader.
+// Used by all protocols except RTSP.
+func (s *Stream) RemoveReader(r *Reader) {
+	s.detachReader(r)
+
+	r.stop()
+}
+
+// RemoveReaderGracefully removes a reader after processing all queued data.
+func (s *Stream) RemoveReaderGracefully(r *Reader) {
+	s.detachReader(r)
+	r.WaitUntilEmpty()
 	r.stop()
 }
 

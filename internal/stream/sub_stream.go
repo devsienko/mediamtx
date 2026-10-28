@@ -3,6 +3,7 @@ package stream
 import (
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
@@ -90,8 +91,12 @@ type SubStream struct {
 	Stream        *Stream
 	InDesc        *description.Session
 	UseRTPPackets bool
+	// OnDataH264 is called outside of the Stream mutex before an H264 unit is
+	// dispatched. The returned function, when non-nil, is called after dispatch.
+	OnDataH264 func([][]byte) ([][]byte, func())
 
-	medias map[*description.Media]*subStreamMedia
+	writeMutex sync.Mutex
+	medias     map[*description.Media]*subStreamMedia
 }
 
 // Initialize initializes the SubStream.
@@ -128,6 +133,7 @@ func (ss *SubStream) Initialize() error {
 			inMedia:       inMedia,
 			streamMedia:   ss.Stream.medias[origMedia],
 			useRTPPackets: ss.UseRTPPackets,
+			onDataH264:    ss.OnDataH264,
 		}
 		err := ssm.initialize()
 		if err != nil {
@@ -167,15 +173,47 @@ func (ss *SubStream) Initialize() error {
 
 // WriteUnit writes a Unit.
 func (ss *SubStream) WriteUnit(inMedia *description.Media, inFormat format.Format, u *unit.Unit) {
-	ss.Stream.mutex.RLock()
-	defer ss.Stream.mutex.RUnlock()
+	ss.writeMutex.Lock()
+	defer ss.writeMutex.Unlock()
 
+	ss.Stream.mutex.RLock()
 	if ss.Stream.subStream != ss {
+		ss.Stream.mutex.RUnlock()
 		return
 	}
 
 	ssm := ss.medias[inMedia]
 	ssf := ssm.formats[inFormat]
+	err := ssf.prepareUnit(u)
+	ss.Stream.mutex.RUnlock()
+	if err != nil {
+		ssf.streamFormat.inboundFramesInError.Add(err)
+		return
+	}
 
-	ssf.writeUnit(u)
+	var afterDispatch func()
+	controlRemoved := false
+	if ssf.onDataH264 != nil && !u.NilPayload() {
+		if payload, ok := u.Payload.(unit.PayloadH264); ok {
+			var filtered [][]byte
+			filtered, afterDispatch = ssf.onDataH264(payload)
+			controlRemoved = len(filtered) != len(payload)
+			u.Payload = unit.PayloadH264(filtered)
+		}
+	}
+
+	ss.Stream.mutex.RLock()
+	if ss.Stream.subStream == ss {
+		size, err := ssf.finalizeUnit(u, controlRemoved)
+		if err != nil {
+			ssf.streamFormat.inboundFramesInError.Add(err)
+		} else {
+			ssf.dispatchUnit(u, size)
+		}
+	}
+	ss.Stream.mutex.RUnlock()
+
+	if afterDispatch != nil {
+		afterDispatch()
+	}
 }

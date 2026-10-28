@@ -294,11 +294,12 @@ def pump_h264(
             if current_type == 9:  # access unit delimiter
                 at_access_unit_start = True
             elif current_type in (1, 5) and at_access_unit_start:  # non-IDR / IDR slice
-                while True:
-                    try:
-                        publisher_stdin.write(pending_sei.get_nowait())
-                    except queue.Empty:
-                        break
+                # The protocol accepts exactly one command per access unit.
+                # Keep additional key presses queued for following frames.
+                try:
+                    publisher_stdin.write(pending_sei.get_nowait())
+                except queue.Empty:
+                    pass
                 at_access_unit_start = False
 
             publisher_stdin.write(nal)

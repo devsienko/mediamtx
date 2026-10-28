@@ -31,8 +31,9 @@ type recorderInstance struct {
 	skip        bool
 	reader      *stream.Reader
 
-	terminate chan struct{}
-	done      chan struct{}
+	terminate           chan struct{}
+	terminateGracefully chan struct{}
+	done                chan struct{}
 }
 
 // Log implements logger.Writer.
@@ -53,6 +54,7 @@ func (ri *recorderInstance) initialize() {
 	}
 
 	ri.terminate = make(chan struct{})
+	ri.terminateGracefully = make(chan struct{})
 	ri.done = make(chan struct{})
 
 	switch ri.format {
@@ -78,9 +80,19 @@ func (ri *recorderInstance) initialize() {
 	go ri.run()
 }
 
-func (ri *recorderInstance) close() {
-	close(ri.terminate)
+func (ri *recorderInstance) close(gracefully bool) {
+	if gracefully {
+		close(ri.terminateGracefully)
+	} else {
+		close(ri.terminate)
+	}
 	<-ri.done
+}
+
+func (ri *recorderInstance) flush() {
+	if !ri.skip {
+		ri.reader.WaitUntilEmpty()
+	}
 }
 
 func (ri *recorderInstance) run() {
@@ -90,13 +102,19 @@ func (ri *recorderInstance) run() {
 		select {
 		case err := <-ri.reader.Error():
 			ri.Log(logger.Error, err.Error())
+			ri.stream.RemoveReader(ri.reader)
 
 		case <-ri.terminate:
-		}
+			ri.stream.RemoveReader(ri.reader)
 
-		ri.stream.RemoveReader(ri.reader)
+		case <-ri.terminateGracefully:
+			ri.stream.RemoveReaderGracefully(ri.reader)
+		}
 	} else {
-		<-ri.terminate
+		select {
+		case <-ri.terminate:
+		case <-ri.terminateGracefully:
+		}
 	}
 
 	ri.format2.close()

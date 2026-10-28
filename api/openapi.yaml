@@ -1047,6 +1047,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AlwaysAvailableTrack"
+        archiveControl:
+          type: boolean
+        archiveControlMaxAge:
+          type: string
+        archiveControlMinRestartInterval:
+          type: string
+        archiveControlUUID:
+          type: string
         disablePublisherOverride:
           type: boolean
           nullable: true

@@ -13,6 +13,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/google/uuid"
 
+	"github.com/bluenviron/mediamtx/internal/archivecontrol"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
@@ -101,6 +102,35 @@ type pathAPIStaticSourcesGetReq struct {
 	res  chan pathAPIStaticSourcesGetRes
 }
 
+type archiveControlRuntimeConfig struct {
+	enabled            bool
+	uuid               uuid.UUID
+	maxAge             time.Duration
+	minRestartInterval time.Duration
+}
+
+type archiveControlSource struct {
+	generation uint64
+	done       chan struct{}
+}
+
+type archiveControlRequestPhase int
+
+const (
+	archiveControlRequestStart archiveControlRequestPhase = iota
+	archiveControlRequestStopPrepare
+	archiveControlRequestStopCommit
+)
+
+type archiveControlRequest struct {
+	phase      archiveControlRequestPhase
+	source     *archiveControlSource
+	config     *archiveControlRuntimeConfig
+	metadata   archivecontrol.Metadata
+	receivedAt time.Time
+	res        chan bool
+}
+
 type path struct {
 	parentCtx         context.Context
 	logLevel          conf.LogLevel
@@ -131,6 +161,13 @@ type path struct {
 	source                         defs.Source
 	stream                         *stream.Stream
 	recorder                       *recorder.Recorder
+	archiveControlConfig           atomic.Pointer[archiveControlRuntimeConfig]
+	archiveControlGeneration       uint64
+	archiveControlSource           *archiveControlSource
+	archiveControlLastSequence     uint64
+	archiveControlRecordGeneration uint64
+	archiveControlPendingStop      uint64
+	archiveControlNextStart        time.Time
 	forwardManager                 *forward.Manager
 	availableTime                  time.Time
 	onlineTime                     time.Time
@@ -158,9 +195,37 @@ type path struct {
 	chRemoveReader            chan defs.PathRemoveReaderReq
 	chAPIPathsGet             chan pathAPIPathsGetReq
 	chAPIStaticSourcesGet     chan pathAPIStaticSourcesGetReq
+	chArchiveControl          chan archiveControlRequest
 
 	// out
 	done chan struct{}
+}
+
+func (pa *path) storeArchiveControlConfig(pathConf *conf.Path) *archiveControlRuntimeConfig {
+	parsedUUID, err := uuid.Parse(pathConf.ArchiveControlUUID)
+	if err != nil || parsedUUID == uuid.Nil {
+		// Configurations are validated before reaching a path. Keep a safe
+		// fallback for tests that construct a path directly.
+		parsedUUID = uuid.MustParse(archivecontrol.DefaultUUID)
+	}
+
+	previous := pa.archiveControlConfig.Load()
+	if previous != nil &&
+		previous.enabled == pathConf.ArchiveControl &&
+		previous.uuid == parsedUUID &&
+		previous.maxAge == time.Duration(pathConf.ArchiveControlMaxAge) &&
+		previous.minRestartInterval == time.Duration(pathConf.ArchiveControlMinRestartInterval) {
+		return previous
+	}
+
+	next := &archiveControlRuntimeConfig{
+		enabled:            pathConf.ArchiveControl,
+		uuid:               parsedUUID,
+		maxAge:             time.Duration(pathConf.ArchiveControlMaxAge),
+		minRestartInterval: time.Duration(pathConf.ArchiveControlMinRestartInterval),
+	}
+	pa.archiveControlConfig.Store(next)
+	return next
 }
 
 func (pa *path) initialize() {
@@ -169,6 +234,7 @@ func (pa *path) initialize() {
 	pa.confName = pa.conf.Name
 	pa.ctx = ctx
 	pa.ctxCancel = ctxCancel
+	pa.storeArchiveControlConfig(pa.conf)
 	pa.readers = make(map[defs.Reader]struct{})
 	pa.onDemandStaticSourceReadyTimer = emptyTimer()
 	pa.onDemandStaticSourceCloseTimer = emptyTimer()
@@ -184,6 +250,7 @@ func (pa *path) initialize() {
 	pa.chRemoveReader = make(chan defs.PathRemoveReaderReq)
 	pa.chAPIPathsGet = make(chan pathAPIPathsGetReq)
 	pa.chAPIStaticSourcesGet = make(chan pathAPIStaticSourcesGetReq)
+	pa.chArchiveControl = make(chan archiveControlRequest)
 	pa.done = make(chan struct{})
 
 	pa.forwardManager = &forward.Manager{
@@ -276,6 +343,7 @@ func (pa *path) run() {
 	pa.parent.removePath(pa)
 
 	pa.ctxCancel()
+	pa.deactivateArchiveControlSource()
 
 	pa.onDemandStaticSourceReadyTimer.Stop()
 	pa.onDemandStaticSourceCloseTimer.Stop()
@@ -400,6 +468,9 @@ func (pa *path) runInner() error {
 		case req := <-pa.chAPIStaticSourcesGet:
 			pa.doAPIStaticSourcesGet(req)
 
+		case req := <-pa.chArchiveControl:
+			pa.doArchiveControl(req)
+
 		case <-pa.ctx.Done():
 			return fmt.Errorf("terminated")
 		}
@@ -447,10 +518,33 @@ func (pa *path) doOnDemandPublisherCloseTimer() {
 }
 
 func (pa *path) doReloadConf(newConf *conf.Path) {
+	oldArchiveControlConfig := pa.archiveControlConfig.Load()
+	recordSettingsChanged :=
+		newConf.RecordPath != pa.conf.RecordPath ||
+			newConf.RecordFormat != pa.conf.RecordFormat ||
+			newConf.RecordPartDuration != pa.conf.RecordPartDuration ||
+			newConf.RecordMaxPartSize != pa.conf.RecordMaxPartSize ||
+			newConf.RecordSegmentDuration != pa.conf.RecordSegmentDuration ||
+			newConf.RecordDeleteAfter != pa.conf.RecordDeleteAfter
+
 	pa.confMutex.Lock()
-	oldConf := pa.conf
 	pa.conf = newConf
 	pa.confMutex.Unlock()
+	newArchiveControlConfig := pa.storeArchiveControlConfig(newConf)
+
+	if oldArchiveControlConfig != newArchiveControlConfig {
+		pa.archiveControlLastSequence = 0
+		pa.archiveControlNextStart = time.Time{}
+
+		// A UUID change or disabling the protocol invalidates the previous
+		// controller. This prevents a SEI-only recording from becoming
+		// impossible to stop.
+		if !newArchiveControlConfig.enabled ||
+			(oldArchiveControlConfig != nil && oldArchiveControlConfig.uuid != newArchiveControlConfig.uuid) {
+			pa.archiveControlPendingStop = 0
+			pa.archiveControlRecordGeneration = 0
+		}
+	}
 
 	if pa.conf.HasStaticSource() {
 		pa.source.(*staticsources.Handler).ReloadConf(newConf)
@@ -458,23 +552,36 @@ func (pa *path) doReloadConf(newConf *conf.Path) {
 
 	pa.forwardManager.ReloadConf(newConf.Forward)
 
-	if pa.recorder != nil &&
-		(newConf.Record != oldConf.Record ||
-			newConf.RecordPath != oldConf.RecordPath ||
-			newConf.RecordFormat != oldConf.RecordFormat ||
-			newConf.RecordPartDuration != oldConf.RecordPartDuration ||
-			newConf.RecordMaxPartSize != oldConf.RecordMaxPartSize ||
-			newConf.RecordSegmentDuration != oldConf.RecordSegmentDuration ||
-			newConf.RecordDeleteAfter != oldConf.RecordDeleteAfter ||
-			newConf.AlwaysAvailableRecorded != oldConf.AlwaysAvailableRecorded) {
-		pa.recorder.Close()
-		pa.recorder = nil
+	pa.reconcileRecording(recordSettingsChanged, true)
+}
+
+func (pa *path) newArchiveControlSource() *archiveControlSource {
+	pa.archiveControlGeneration++
+	return &archiveControlSource{
+		generation: pa.archiveControlGeneration,
+		done:       make(chan struct{}),
+	}
+}
+
+func (pa *path) activateArchiveControlSource(source *archiveControlSource) {
+	pa.deactivateArchiveControlSource()
+	pa.archiveControlSource = source
+	pa.archiveControlLastSequence = 0
+	pa.archiveControlPendingStop = 0
+	pa.archiveControlNextStart = time.Time{}
+}
+
+func (pa *path) deactivateArchiveControlSource() {
+	if pa.archiveControlSource != nil {
+		close(pa.archiveControlSource.done)
+		pa.archiveControlSource = nil
 	}
 
-	if newConf.Record && pa.stream != nil && pa.recorder == nil &&
-		(!newConf.AlwaysAvailable || newConf.AlwaysAvailableRecorded || pa.isOnline()) {
-		pa.startRecording()
-	}
+	pa.archiveControlLastSequence = 0
+	pa.archiveControlPendingStop = 0
+	pa.archiveControlRecordGeneration = 0
+	pa.archiveControlNextStart = time.Time{}
+	pa.reconcileRecording(false, true)
 }
 
 func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
@@ -486,9 +593,13 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 		}
 	}
 
+	controlSource := pa.newArchiveControlSource()
 	subStream := &stream.SubStream{
 		Stream:        pa.stream,
 		UseRTPPackets: req.UseRTPPackets,
+		OnDataH264: func(au [][]byte) ([][]byte, func()) {
+			return pa.onDataH264(controlSource, au)
+		},
 	}
 
 	if pa.conf.AlwaysAvailable {
@@ -497,6 +608,7 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 
 	err := subStream.Initialize()
 	if err != nil {
+		close(controlSource.done)
 		req.Res <- defs.PathSourceStaticSetReadyRes{Err: err}
 		return
 	}
@@ -504,6 +616,7 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 	if pa.conf.AlwaysAvailable {
 		pa.setOnline(pa.source.APISourceDescribe(), "")
 	}
+	pa.activateArchiveControlSource(controlSource)
 
 	if pa.conf.HasOnDemandStaticSource() {
 		pa.onDemandStaticSourceReadyTimer.Stop()
@@ -598,6 +711,7 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 		}
 
 		pa.Log(logger.Info, "closing existing publisher")
+		pa.deactivateArchiveControlSource()
 		pa.source.(defs.Publisher).Close()
 		pa.executeRemovePublisher()
 	}
@@ -610,9 +724,13 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 		}
 	}
 
+	controlSource := pa.newArchiveControlSource()
 	subStream := &stream.SubStream{
 		Stream:        pa.stream,
 		UseRTPPackets: req.UseRTPPackets,
+		OnDataH264: func(au [][]byte) ([][]byte, func()) {
+			return pa.onDataH264(controlSource, au)
+		},
 	}
 
 	if pa.conf.AlwaysAvailable {
@@ -621,6 +739,7 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 
 	err := subStream.Initialize()
 	if err != nil {
+		close(controlSource.done)
 		req.Res <- defs.PathAddPublisherRes{Err: err}
 		return
 	}
@@ -633,6 +752,7 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 	if pa.conf.AlwaysAvailable {
 		pa.setOnline(req.Author.APISourceDescribe(), req.AccessRequest.Query)
 	}
+	pa.activateArchiveControlSource(controlSource)
 
 	if pa.conf.HasOnDemandPublisher() && pa.onDemandPublisherState != pathOnDemandStateInitial {
 		pa.onDemandPublisherReadyTimer.Stop()
@@ -860,6 +980,7 @@ func (pa *path) onDemandStaticSourceStop(reason string) {
 
 	pa.onDemandStaticSourceState = pathOnDemandStateInitial
 
+	pa.deactivateArchiveControlSource()
 	pa.source.(*staticsources.Handler).Stop(reason)
 }
 
@@ -910,25 +1031,18 @@ func (pa *path) setOnline(sourceDesc *defs.APIPathSource, publisherQuery string)
 	})
 
 	pa.onlineTime = time.Now()
-
-	if pa.conf.AlwaysAvailable && pa.conf.Record &&
-		!pa.conf.AlwaysAvailableRecorded && pa.recorder == nil {
-		pa.startRecording()
-	}
+	pa.reconcileRecording(false, true)
 }
 
 func (pa *path) setOffline() {
-	if pa.conf.AlwaysAvailable && !pa.conf.AlwaysAvailableRecorded && pa.recorder != nil {
-		pa.recorder.Close()
-		pa.recorder = nil
+	pa.deactivateArchiveControlSource()
+
+	if pa.onOfflineHook != nil {
+		pa.onOfflineHook()
+		pa.onOfflineHook = nil
 	}
 
-	if pa.onOfflineHook == nil {
-		return
-	}
-
-	pa.onOfflineHook()
-	pa.onOfflineHook = nil
+	pa.reconcileRecording(false, true)
 }
 
 func (pa *path) setAvailable(
@@ -974,9 +1088,7 @@ func (pa *path) setAvailable(
 
 	pa.forwardManager.Start(pa.stream)
 
-	if pa.conf.Record && (!pa.conf.AlwaysAvailable || pa.conf.AlwaysAvailableRecorded) {
-		pa.startRecording()
-	}
+	pa.reconcileRecording(false, true)
 
 	if pa.conf.AlwaysAvailable {
 		pa.Log(logger.Info, "stream is available, %s", defs.MediasInfo(pa.stream.OrigDesc.Medias))
@@ -1014,10 +1126,7 @@ func (pa *path) setNotAvailable() {
 
 	pa.onUnavailableHook()
 
-	if pa.recorder != nil {
-		pa.recorder.Close()
-		pa.recorder = nil
-	}
+	pa.stopRecording(true)
 
 	pa.forwardManager.Stop()
 
@@ -1027,7 +1136,54 @@ func (pa *path) setNotAvailable() {
 	}
 }
 
+func (pa *path) configWantsRecording() bool {
+	return pa.conf.Record && pa.stream != nil &&
+		(!pa.conf.AlwaysAvailable || pa.conf.AlwaysAvailableRecorded || pa.isOnline())
+}
+
+func (pa *path) archiveControlWantsRecording() bool {
+	config := pa.archiveControlConfig.Load()
+	return config != nil && config.enabled &&
+		pa.stream != nil && pa.isOnline() &&
+		pa.archiveControlSource != nil &&
+		pa.archiveControlRecordGeneration == pa.archiveControlSource.generation
+}
+
+func (pa *path) reconcileRecording(forceRestart bool, graceful bool) {
+	wantRecording := pa.configWantsRecording() || pa.archiveControlWantsRecording()
+
+	if forceRestart && pa.recorder != nil {
+		pa.stopRecording(graceful)
+	}
+
+	if !wantRecording {
+		pa.stopRecording(graceful)
+		return
+	}
+
+	if pa.recorder == nil {
+		pa.startRecording()
+	}
+}
+
+func (pa *path) stopRecording(graceful bool) {
+	if pa.recorder == nil {
+		return
+	}
+
+	if graceful {
+		pa.recorder.CloseGracefully()
+	} else {
+		pa.recorder.Close()
+	}
+	pa.recorder = nil
+}
+
 func (pa *path) startRecording() {
+	if pa.recorder != nil || pa.stream == nil {
+		return
+	}
+
 	pa.recorder = &recorder.Recorder{
 		PathFormat:      pa.conf.RecordPath,
 		Format:          pa.conf.RecordFormat,
@@ -1037,14 +1193,15 @@ func (pa *path) startRecording() {
 		PathName:        pa.name,
 		Stream:          pa.stream,
 		OnSegmentCreate: func(segmentPath string) {
-			if pa.conf.RunOnRecordSegmentCreate != "" {
+			pathConf := pa.SafeConf()
+			if pathConf.RunOnRecordSegmentCreate != "" {
 				env := pa.ExternalCmdEnv()
 				env["MTX_SEGMENT_PATH"] = segmentPath
 
 				pa.Log(logger.Info, "runOnRecordSegmentCreate command launched")
 				cmd := &externalcmd.Cmd{
 					Pool:    pa.externalCmdPool,
-					Cmdstr:  pa.conf.RunOnRecordSegmentCreate,
+					Cmdstr:  pathConf.RunOnRecordSegmentCreate,
 					Restart: false,
 					Env:     env,
 				}
@@ -1052,7 +1209,8 @@ func (pa *path) startRecording() {
 			}
 		},
 		OnSegmentComplete: func(segmentPath string, segmentDuration time.Duration) {
-			if pa.conf.RunOnRecordSegmentComplete != "" {
+			pathConf := pa.SafeConf()
+			if pathConf.RunOnRecordSegmentComplete != "" {
 				env := pa.ExternalCmdEnv()
 				env["MTX_SEGMENT_PATH"] = segmentPath
 				env["MTX_SEGMENT_DURATION"] = strconv.FormatFloat(segmentDuration.Seconds(), 'f', -1, 64)
@@ -1060,7 +1218,7 @@ func (pa *path) startRecording() {
 				pa.Log(logger.Info, "runOnRecordSegmentComplete command launched")
 				cmd := &externalcmd.Cmd{
 					Pool:    pa.externalCmdPool,
-					Cmdstr:  pa.conf.RunOnRecordSegmentComplete,
+					Cmdstr:  pathConf.RunOnRecordSegmentComplete,
 					Restart: false,
 					Env:     env,
 				}
@@ -1070,6 +1228,167 @@ func (pa *path) startRecording() {
 		Parent: pa,
 	}
 	pa.recorder.Initialize()
+}
+
+func (pa *path) sendArchiveControlRequest(req archiveControlRequest) bool {
+	select {
+	case pa.chArchiveControl <- req:
+	case <-req.source.done:
+		return false
+	case <-pa.ctx.Done():
+		return false
+	}
+
+	select {
+	case accepted := <-req.res:
+		return accepted
+	case <-req.source.done:
+		return false
+	case <-pa.ctx.Done():
+		return false
+	}
+}
+
+func (pa *path) onDataH264(source *archiveControlSource, au [][]byte) ([][]byte, func()) {
+	config := pa.archiveControlConfig.Load()
+	if config == nil || !config.enabled {
+		return au, nil
+	}
+
+	metadata, filteredAU, ok := archivecontrol.ParseAndRemoveH264(au, config.uuid)
+	if !ok {
+		return au, nil
+	}
+
+	req := archiveControlRequest{
+		source:     source,
+		config:     config,
+		metadata:   metadata,
+		receivedAt: time.Now(),
+		res:        make(chan bool, 1),
+	}
+
+	switch metadata.Command {
+	case archivecontrol.CommandStart:
+		req.phase = archiveControlRequestStart
+		pa.sendArchiveControlRequest(req)
+		return filteredAU, nil
+
+	case archivecontrol.CommandStop:
+		req.phase = archiveControlRequestStopPrepare
+		if !pa.sendArchiveControlRequest(req) {
+			return filteredAU, nil
+		}
+
+		return filteredAU, func() {
+			commitReq := req
+			commitReq.phase = archiveControlRequestStopCommit
+			commitReq.res = make(chan bool, 1)
+			pa.sendArchiveControlRequest(commitReq)
+		}
+
+	default:
+		return filteredAU, nil
+	}
+}
+
+func (pa *path) doArchiveControl(req archiveControlRequest) {
+	accepted := false
+	defer func() {
+		req.res <- accepted
+	}()
+
+	if req.phase == archiveControlRequestStopCommit {
+		if req.source != pa.archiveControlSource ||
+			pa.archiveControlPendingStop != req.metadata.Sequence {
+			return
+		}
+
+		pa.archiveControlPendingStop = 0
+		pa.archiveControlRecordGeneration = 0
+		config := pa.archiveControlConfig.Load()
+		if config != nil {
+			pa.archiveControlNextStart = time.Now().Add(config.minRestartInterval)
+		}
+		pa.reconcileRecording(false, true)
+		pa.Log(logger.Info, "recording stopped by H264 SEI command")
+		accepted = true
+		return
+	}
+
+	currentConfig := pa.archiveControlConfig.Load()
+	if req.config != currentConfig || currentConfig == nil || !currentConfig.enabled ||
+		req.source != pa.archiveControlSource || pa.stream == nil || !pa.isOnline() {
+		return
+	}
+
+	if req.metadata.Stream != pa.name || req.metadata.Sequence == 0 ||
+		req.metadata.Sequence <= pa.archiveControlLastSequence {
+		return
+	}
+
+	commandTime, err := time.Parse(time.RFC3339Nano, req.metadata.Timestamp)
+	if err != nil {
+		return
+	}
+
+	if currentConfig.maxAge > 0 {
+		age := req.receivedAt.Sub(commandTime)
+		if age < 0 {
+			age = -age
+		}
+		if age > currentConfig.maxAge {
+			pa.Log(logger.Warn, "archive control command ignored: timestamp is outside the allowed window")
+			return
+		}
+	}
+
+	expectedCommand := archivecontrol.CommandStart
+	if req.phase == archiveControlRequestStopPrepare {
+		expectedCommand = archivecontrol.CommandStop
+	}
+	if req.metadata.Command != expectedCommand {
+		return
+	}
+
+	pa.archiveControlLastSequence = req.metadata.Sequence
+
+	switch req.phase {
+	case archiveControlRequestStart:
+		if pa.archiveControlRecordGeneration == req.source.generation {
+			accepted = true
+			return
+		}
+		if req.receivedAt.Before(pa.archiveControlNextStart) {
+			pa.Log(logger.Warn, "archive.start SEI ignored: start rate limit exceeded")
+			return
+		}
+
+		pa.archiveControlRecordGeneration = req.source.generation
+		pa.archiveControlPendingStop = 0
+		pa.reconcileRecording(false, true)
+		pa.Log(logger.Info, "recording started by H264 SEI command")
+		accepted = true
+
+	case archiveControlRequestStopPrepare:
+		if pa.archiveControlRecordGeneration != req.source.generation {
+			return
+		}
+
+		pa.archiveControlPendingStop = req.metadata.Sequence
+		if pa.recorder != nil && !pa.configWantsRecording() {
+			if pa.conf.RecordFormat == conf.RecordFormatMPEGTS {
+				// MPEG-TS writes each access unit immediately, therefore the
+				// recorder must be detached before the exclusive stop boundary.
+				pa.stopRecording(true)
+			} else {
+				// fMP4 needs the stop access unit as lookahead in order to derive
+				// the duration of the preceding sample.
+				pa.recorder.Flush()
+			}
+		}
+		accepted = true
+	}
 }
 
 func (pa *path) executeRemoveReader(r defs.Reader) {

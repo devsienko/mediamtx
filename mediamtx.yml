@@ -598,7 +598,8 @@ pathDefaults:
   ###############################################
   # Default path settings -> Camera events
 
-  # Base URL of the service that receives H264 SEI camera events.
+  # Base URL of the service that receives H264 SEI camera state changes.
+  # Repeated heartbeats with an unchanged eventType/objectType state are suppressed.
   # An empty value disables event forwarding. MediaMTX appends /camera-event.
   cameraEventServiceURL:
   # UUID of camera-event user_data_unregistered SEI messages.

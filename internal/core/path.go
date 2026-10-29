@@ -106,7 +106,10 @@ type pathAPIStaticSourcesGetReq struct {
 	res  chan pathAPIStaticSourcesGetRes
 }
 
-const cameraEventQueueSize = 256
+const (
+	cameraEventQueueSize          = 256
+	cameraEventMaxStatesPerSource = 256
+)
 
 type cameraEventRuntimeConfig struct {
 	endpoint string
@@ -117,6 +120,31 @@ type cameraEventRuntimeConfig struct {
 type cameraEventDelivery struct {
 	config  *cameraEventRuntimeConfig
 	message cameraevent.Message
+	source  *cameraEventSourceState
+	key     cameraEventStateKey
+	version uint64
+}
+
+type cameraEventStateKey struct {
+	eventType  string
+	objectType string
+}
+
+type cameraEventObservedState struct {
+	active    bool
+	timestamp int64
+	config    *cameraEventRuntimeConfig
+	version   uint64
+	pending   bool
+	delivered bool
+}
+
+type cameraEventSourceState struct {
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mutex            sync.Mutex
+	states           map[cameraEventStateKey]*cameraEventObservedState
+	stateLimitLogged bool
 }
 
 type path struct {
@@ -150,6 +178,7 @@ type path struct {
 	stream                         *stream.Stream
 	recorder                       *recorder.Recorder
 	cameraEventConfig              atomic.Pointer[cameraEventRuntimeConfig]
+	cameraEventSource              atomic.Pointer[cameraEventSourceState]
 	cameraEventQueue               chan cameraEventDelivery
 	cameraEventHTTPClient          *http.Client
 	forwardManager                 *forward.Manager
@@ -212,6 +241,29 @@ func (pa *path) storeCameraEventConfig(pathConf *conf.Path) *cameraEventRuntimeC
 	}
 	pa.cameraEventConfig.Store(next)
 	return next
+}
+
+func (pa *path) newCameraEventSourceState() *cameraEventSourceState {
+	ctx, cancel := context.WithCancel(pa.ctx)
+	return &cameraEventSourceState{
+		ctx:    ctx,
+		cancel: cancel,
+		states: make(map[cameraEventStateKey]*cameraEventObservedState),
+	}
+}
+
+func (pa *path) activateCameraEventSource(source *cameraEventSourceState) {
+	previous := pa.cameraEventSource.Swap(source)
+	if previous != nil && previous != source {
+		previous.cancel()
+	}
+}
+
+func (pa *path) deactivateCameraEventSource() {
+	previous := pa.cameraEventSource.Swap(nil)
+	if previous != nil {
+		previous.cancel()
+	}
 }
 
 func (pa *path) initialize() {
@@ -539,10 +591,13 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 		}
 	}
 
+	eventSource := pa.newCameraEventSourceState()
 	subStream := &stream.SubStream{
 		Stream:        pa.stream,
 		UseRTPPackets: req.UseRTPPackets,
-		OnDataH264:    pa.onDataH264,
+		OnDataH264: func(au [][]byte) ([][]byte, func()) {
+			return pa.onDataH264(eventSource, au)
+		},
 	}
 
 	if pa.conf.AlwaysAvailable {
@@ -551,6 +606,7 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 
 	err := subStream.Initialize()
 	if err != nil {
+		eventSource.cancel()
 		req.Res <- defs.PathSourceStaticSetReadyRes{Err: err}
 		return
 	}
@@ -564,6 +620,7 @@ func (pa *path) doSourceStaticSetReady(req defs.PathSourceStaticSetReadyReq) {
 		pa.onDemandStaticSourceScheduleClose()
 	}
 
+	pa.activateCameraEventSource(eventSource)
 	pa.consumeOnHoldRequests()
 
 	req.Res <- defs.PathSourceStaticSetReadyRes{SubStream: subStream}
@@ -663,10 +720,13 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 		}
 	}
 
+	eventSource := pa.newCameraEventSourceState()
 	subStream := &stream.SubStream{
 		Stream:        pa.stream,
 		UseRTPPackets: req.UseRTPPackets,
-		OnDataH264:    pa.onDataH264,
+		OnDataH264: func(au [][]byte) ([][]byte, func()) {
+			return pa.onDataH264(eventSource, au)
+		},
 	}
 
 	if pa.conf.AlwaysAvailable {
@@ -675,6 +735,7 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 
 	err := subStream.Initialize()
 	if err != nil {
+		eventSource.cancel()
 		req.Res <- defs.PathAddPublisherRes{Err: err}
 		return
 	}
@@ -693,6 +754,7 @@ func (pa *path) doAddPublisher(req defs.PathAddPublisherReq) {
 		pa.onDemandPublisherScheduleClose()
 	}
 
+	pa.activateCameraEventSource(eventSource)
 	pa.consumeOnHoldRequests()
 
 	req.Res <- defs.PathAddPublisherRes{SubStream: subStream}
@@ -967,6 +1029,8 @@ func (pa *path) setOnline(sourceDesc *defs.APIPathSource, publisherQuery string)
 }
 
 func (pa *path) setOffline() {
+	pa.deactivateCameraEventSource()
+
 	if pa.onOfflineHook != nil {
 		pa.onOfflineHook()
 		pa.onOfflineHook = nil
@@ -1152,7 +1216,7 @@ func (pa *path) startRecording() {
 	pa.recorder.Initialize()
 }
 
-func (pa *path) onDataH264(au [][]byte) ([][]byte, func()) {
+func (pa *path) onDataH264(source *cameraEventSourceState, au [][]byte) ([][]byte, func()) {
 	config := pa.cameraEventConfig.Load()
 	if config == nil || config.endpoint == "" {
 		return au, nil
@@ -1163,12 +1227,68 @@ func (pa *path) onDataH264(au [][]byte) ([][]byte, func()) {
 		return au, nil
 	}
 
+	key := cameraEventStateKey{
+		eventType:  message.Event.EventType,
+		objectType: message.Event.ObjectType,
+	}
+	active := message.Event.EventPhase == "Start"
+
+	source.mutex.Lock()
+	defer source.mutex.Unlock()
+
+	if pa.cameraEventSource.Load() != source || source.ctx.Err() != nil {
+		return filteredAU, nil
+	}
+
+	state, exists := source.states[key]
+	if exists && message.Event.Timestamp < state.timestamp {
+		pa.Log(logger.Debug,
+			"outdated camera event ignored: type=%s object=%s timestamp=%d current=%d",
+			key.eventType, key.objectType, message.Event.Timestamp, state.timestamp)
+		return filteredAU, nil
+	}
+
+	if !exists {
+		if len(source.states) >= cameraEventMaxStatesPerSource {
+			if !source.stateLimitLogged {
+				pa.Log(logger.Warn, "camera event state limit reached; additional event types are ignored")
+				source.stateLimitLogged = true
+			}
+			return filteredAU, nil
+		}
+
+		state = &cameraEventObservedState{
+			active:    active,
+			timestamp: message.Event.Timestamp,
+			config:    config,
+			version:   1,
+		}
+		source.states[key] = state
+	} else if state.active != active || state.config != config {
+		state.active = active
+		state.timestamp = message.Event.Timestamp
+		state.config = config
+		state.version++
+		state.pending = false
+		state.delivered = false
+	} else if message.Event.Timestamp > state.timestamp {
+		state.timestamp = message.Event.Timestamp
+	}
+
+	if state.pending || state.delivered {
+		return filteredAU, nil
+	}
+
 	delivery := cameraEventDelivery{
 		config:  config,
 		message: message,
+		source:  source,
+		key:     key,
+		version: state.version,
 	}
 	select {
 	case pa.cameraEventQueue <- delivery:
+		state.pending = true
 		pa.Log(logger.Debug, "camera event queued: id=%s phase=%s",
 			message.Event.EventID, message.Event.EventPhase)
 	default:
@@ -1178,13 +1298,35 @@ func (pa *path) onDataH264(au [][]byte) ([][]byte, func()) {
 	return filteredAU, nil
 }
 
+func (delivery *cameraEventDelivery) complete(success bool) {
+	delivery.source.mutex.Lock()
+	defer delivery.source.mutex.Unlock()
+
+	state, ok := delivery.source.states[delivery.key]
+	if !ok || state.version != delivery.version {
+		return
+	}
+
+	state.pending = false
+	if success {
+		state.delivered = true
+	}
+}
+
 func (pa *path) runCameraEventWorker() {
 	defer pa.wg.Done()
 
 	for {
 		select {
 		case delivery := <-pa.cameraEventQueue:
-			if err := pa.deliverCameraEvent(delivery); err != nil {
+			if delivery.source.ctx.Err() != nil {
+				delivery.complete(false)
+				continue
+			}
+
+			err := pa.deliverCameraEvent(delivery)
+			delivery.complete(err == nil)
+			if err != nil && delivery.source.ctx.Err() == nil {
 				pa.Log(logger.Error, "camera event delivery failed: %v", err)
 			}
 
@@ -1202,7 +1344,7 @@ func (pa *path) deliverCameraEvent(delivery cameraEventDelivery) error {
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		requestCtx, cancel := context.WithTimeout(pa.ctx, delivery.config.timeout)
+		requestCtx, cancel := context.WithTimeout(delivery.source.ctx, delivery.config.timeout)
 		req, err := http.NewRequestWithContext(
 			requestCtx,
 			http.MethodPost,
@@ -1244,8 +1386,8 @@ func (pa *path) deliverCameraEvent(delivery cameraEventDelivery) error {
 			retryDelay := time.Duration(attempt+1) * 250 * time.Millisecond
 			select {
 			case <-time.After(retryDelay):
-			case <-pa.ctx.Done():
-				return pa.ctx.Err()
+			case <-delivery.source.ctx.Done():
+				return delivery.source.ctx.Err()
 			}
 		}
 	}

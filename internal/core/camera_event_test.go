@@ -19,6 +19,8 @@ import (
 	"github.com/bluenviron/mediamtx/internal/test"
 )
 
+const cameraEventTestRTSPAddress = "127.0.0.1:18554"
+
 func encodeCameraEventSEIValue(v int) []byte {
 	var out []byte
 	for v >= 255 {
@@ -75,7 +77,7 @@ func newCameraEventPublisher(t *testing.T) (*gortsplib.Client, func([]byte)) {
 	medi := test.UniqueMediaH264()
 	client := &gortsplib.Client{}
 	err := client.StartRecording(
-		"rtsp://localhost:8554/test",
+		"rtsp://"+cameraEventTestRTSPAddress+"/test",
 		&description.Session{Medias: []*description.Media{medi}})
 	require.NoError(t, err)
 
@@ -118,11 +120,13 @@ func TestCameraEventForwarding(t *testing.T) {
 	defer server.Close()
 
 	p, ok := newInstance(t,
-		"rtmp: no\n"+
+		"rtspAddress: "+cameraEventTestRTSPAddress+"\n"+
+			"rtmp: no\n"+
 			"hls: no\n"+
 			"webrtc: no\n"+
 			"srt: no\n"+
 			"moq: no\n"+
+			"rtspTransports: [tcp]\n"+
 			"paths:\n"+
 			"  test:\n"+
 			"    cameraEventServiceURL: "+server.URL+"\n"+
@@ -169,11 +173,13 @@ func TestCameraEventForwarding(t *testing.T) {
 
 func TestCameraEventDisabledWithoutServiceURL(t *testing.T) {
 	p, ok := newInstance(t,
-		"rtmp: no\n"+
+		"rtspAddress: "+cameraEventTestRTSPAddress+"\n"+
+			"rtmp: no\n"+
 			"hls: no\n"+
 			"webrtc: no\n"+
 			"srt: no\n"+
 			"moq: no\n"+
+			"rtspTransports: [tcp]\n"+
 			"paths:\n"+
 			"  test:\n")
 	require.Equal(t, true, ok)
@@ -192,4 +198,180 @@ func TestCameraEventDisabledWithoutServiceURL(t *testing.T) {
 		}}),
 		[]byte{0x65, 0x01},
 	))
+}
+
+func TestCameraEventStateChanges(t *testing.T) {
+	requests := make(chan cameraevent.Message, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var message cameraevent.Message
+		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requests <- message
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	p, ok := newInstance(t,
+		"rtspAddress: "+cameraEventTestRTSPAddress+"\n"+
+			"rtmp: no\n"+
+			"hls: no\n"+
+			"webrtc: no\n"+
+			"srt: no\n"+
+			"moq: no\n"+
+			"rtspTransports: [tcp]\n"+
+			"paths:\n"+
+			"  test:\n"+
+			"    cameraEventServiceURL: "+server.URL+"\n")
+	require.Equal(t, true, ok)
+	defer p.Close()
+
+	client, writeRTP := newCameraEventPublisher(t)
+	defer client.Close()
+
+	sendWith := func(write func([]byte), phase string, timestamp int64) {
+		write(cameraEventSTAPA(
+			[]byte{0x09, 0xf0},
+			cameraEventSEI(t, cameraevent.Message{Event: cameraevent.Event{
+				EventID:    uuid.New(),
+				Timestamp:  timestamp,
+				EventPhase: phase,
+				EventType:  "Motion",
+				ObjectType: "Human",
+			}}),
+			[]byte{0x65, 0x01},
+		))
+	}
+	send := func(phase string, timestamp int64) {
+		sendWith(writeRTP, phase, timestamp)
+	}
+
+	expect := func(phase string) {
+		t.Helper()
+		select {
+		case message := <-requests:
+			require.Equal(t, phase, message.Event.EventPhase)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("camera event phase %s was not delivered", phase)
+		}
+	}
+
+	expectNone := func() {
+		t.Helper()
+		select {
+		case message := <-requests:
+			t.Fatalf("unexpected camera event delivery: %+v", message)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+
+	// The first heartbeat establishes and publishes the initial state.
+	send("Start", 100)
+	expect("Start")
+
+	// A new event ID and timestamp do not cause delivery while the state is unchanged.
+	send("Start", 101)
+	expectNone()
+
+	// A state transition is delivered once; subsequent heartbeats are suppressed.
+	send("Stop", 102)
+	expect("Stop")
+	send("Stop", 103)
+	expectNone()
+
+	// An out-of-order packet must not move the state backwards.
+	send("Start", 101)
+	expectNone()
+
+	// A newer transition is delivered normally.
+	send("Start", 104)
+	expect("Start")
+
+	// A replacement publisher starts from an unknown state and resynchronizes it.
+	client2, writeRTP2 := newCameraEventPublisher(t)
+	defer client2.Close()
+	sendWith(writeRTP2, "Start", 105)
+	expect("Start")
+}
+
+func TestCameraEventHeartbeatRetriesFailedDelivery(t *testing.T) {
+	firstAttempt := make(chan struct{}, 1)
+	delivered := make(chan cameraevent.Message, 1)
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var message cameraevent.Message
+		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if attempts.Add(1) == 1 {
+			firstAttempt <- struct{}{}
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		delivered <- message
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	p, ok := newInstance(t,
+		"rtspAddress: "+cameraEventTestRTSPAddress+"\n"+
+			"rtmp: no\n"+
+			"hls: no\n"+
+			"webrtc: no\n"+
+			"srt: no\n"+
+			"moq: no\n"+
+			"rtspTransports: [tcp]\n"+
+			"paths:\n"+
+			"  test:\n"+
+			"    cameraEventServiceURL: "+server.URL+"\n")
+	require.Equal(t, true, ok)
+	defer p.Close()
+
+	client, writeRTP := newCameraEventPublisher(t)
+	defer client.Close()
+
+	send := func(timestamp int64) {
+		writeRTP(cameraEventSTAPA(
+			[]byte{0x09, 0xf0},
+			cameraEventSEI(t, cameraevent.Message{Event: cameraevent.Event{
+				EventID:    uuid.New(),
+				Timestamp:  timestamp,
+				EventPhase: "Start",
+				EventType:  "Motion",
+				ObjectType: "Human",
+			}}),
+			[]byte{0x65, 0x01},
+		))
+	}
+
+	send(200)
+	select {
+	case <-firstAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first delivery attempt was not received")
+	}
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	timestamp := int64(201)
+
+	for {
+		select {
+		case message := <-delivered:
+			require.Equal(t, "Start", message.Event.EventPhase)
+			require.Equal(t, int32(2), attempts.Load())
+			return
+		case <-ticker.C:
+			send(timestamp)
+			timestamp++
+		case <-timeout.C:
+			t.Fatal("a later heartbeat did not retry the failed state delivery")
+		}
+	}
 }

@@ -28,14 +28,15 @@ export MTX_PATHDEFAULTS_CAMERAEVENTREQUESTTIMEOUT=5s
 For a single path, use `MTX_PATHS_TEST_CAMERAEVENTSERVICEURL`. Environment
 variable names are uppercase and follow the configuration hierarchy.
 
-For every accepted event MediaMTX sends:
+When an accepted event establishes or changes the current camera state,
+MediaMTX sends:
 
 ```http
 POST /camera-event
 Content-Type: application/json
 ```
 
-with the exact JSON envelope received from the camera:
+with a normalized JSON envelope:
 
 ```json
 {
@@ -53,6 +54,24 @@ Delivery happens outside the video processing goroutine. Requests time out,
 retry up to two times after network, 408, 429, or 5xx failures, and are queued
 in order per MediaMTX path. Since a lost HTTP response can produce a retry, the
 receiver must deduplicate requests by `eventId` and `eventPhase`.
+
+## Event state and heartbeats
+
+A camera can repeat its current state in every frame or periodically. MediaMTX
+tracks state independently for each `(path, eventType, objectType)` tuple:
+
+- the first `Start` or `Stop` is forwarded to synchronize the receiver;
+- a repeated phase is consumed but not forwarded;
+- a phase change is forwarded;
+- an event with a timestamp older than the latest state is ignored;
+- a replacement publisher starts with unknown state, so its first event is
+  forwarded again.
+
+The `eventId` can remain constant for all heartbeats of one camera event and is
+not used to detect a state change. If the delivery queue is full or all HTTP
+attempts fail, the state remains unconfirmed and a later heartbeat retries it.
+MediaMTX does not infer `Stop` merely from a missing heartbeat or a disconnected
+publisher.
 
 ## Run
 

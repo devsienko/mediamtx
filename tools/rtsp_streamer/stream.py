@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Publish H.264 over RTSP and inject keyboard-triggered SEI messages."""
+"""Publish H.264 over RTSP and inject keyboard-triggered camera-event SEI."""
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 from fractions import Fraction
 import json
 import os
@@ -26,7 +25,6 @@ REPOSITORY_DIR = SCRIPT_DIR.parent.parent
 DEFAULT_VIDEO = REPOSITORY_DIR / "internal" / "stream" / "offline_h264.mp4"
 DEFAULT_URL = "rtsp://127.0.0.1:8554/test"
 DEFAULT_SEI_UUID = "8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021"
-SCHEMA = "faceter.archive-control.v1"
 
 
 class StopRequested(Exception):
@@ -35,7 +33,7 @@ class StopRequested(Exception):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Publish H.264 over RTSP and inject archive-control SEI messages."
+        description="Publish H.264 over RTSP and inject camera-event SEI messages."
     )
     parser.add_argument(
         "video",
@@ -63,6 +61,16 @@ def parse_args() -> argparse.Namespace:
         "--sei-uuid",
         default=DEFAULT_SEI_UUID,
         help=f"UUID of user_data_unregistered SEI messages (default: {DEFAULT_SEI_UUID})",
+    )
+    parser.add_argument(
+        "--event-type",
+        default="Motion",
+        help="camera event type (default: Motion)",
+    )
+    parser.add_argument(
+        "--object-type",
+        default="Human",
+        help="camera object type (default: Human)",
     )
     parser.add_argument(
         "--once",
@@ -406,7 +414,7 @@ def main() -> int:
     print(f"Stream:   {args.url}")
     print(f"Path:     {path}")
     print(f"SEI UUID: {sei_uuid}")
-    print("Controls: [R] archive.start  [S] archive.stop  [Q/Ctrl+C] quit\n", flush=True)
+    print("Controls: [R] event Start  [S] event Stop  [Q/Ctrl+C] quit\n", flush=True)
 
     def request_stop(_signum: int, _frame: object) -> None:
         raise StopRequested
@@ -416,7 +424,7 @@ def main() -> int:
     publisher: subprocess.Popen[bytes] | None = None
     pump_thread: threading.Thread | None = None
     stopped_by_user = False
-    sequence = 0
+    active_event_id: uuid.UUID | None = None
 
     try:
         publisher = subprocess.Popen(
@@ -452,20 +460,35 @@ def main() -> int:
                         continue
                     key = key.lower()
                     if key in ("r", "s"):
-                        sequence += 1
-                        command = "archive.start" if key == "r" else "archive.stop"
+                        if key == "r":
+                            if active_event_id is not None:
+                                print(
+                                    f"Event {active_event_id} is already active; press S before starting another.",
+                                    flush=True,
+                                )
+                                continue
+                            active_event_id = uuid.uuid4()
+                            event_phase = "Start"
+                        else:
+                            if active_event_id is None:
+                                print("No active event; press R first.", flush=True)
+                                continue
+                            event_phase = "Stop"
+
                         metadata: dict[str, object] = {
-                            "schema": SCHEMA,
-                            "command": command,
-                            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-                                "+00:00", "Z"
-                            ),
-                            "sequence": sequence,
-                            "stream": path,
+                            "event": {
+                                "eventId": str(active_event_id),
+                                "timestamp": int(time.time()),
+                                "eventPhase": event_phase,
+                                "eventType": args.event_type,
+                                "objectType": args.object_type,
+                            }
                         }
                         sei_nal, json_payload = build_sei_nal(sei_uuid, metadata)
                         pending_sei.put(sei_nal)
                         print(f"SEI queued: {json_payload.decode('utf-8')}", flush=True)
+                        if event_phase == "Stop":
+                            active_event_id = None
                     elif key == "q":
                         stopped_by_user = True
                         break

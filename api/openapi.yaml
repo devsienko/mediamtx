@@ -1047,13 +1047,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AlwaysAvailableTrack"
-        archiveControl:
-          type: boolean
-        archiveControlMaxAge:
+        cameraEventRequestTimeout:
           type: string
-        archiveControlMinRestartInterval:
+        cameraEventSEIUUID:
           type: string
-        archiveControlUUID:
+        cameraEventServiceURL:
           type: string
         disablePublisherOverride:
           type: boolean

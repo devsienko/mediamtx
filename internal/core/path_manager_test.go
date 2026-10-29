@@ -38,15 +38,14 @@ func (d *dummyReader) APIReaderDescribe() *defs.APIPathReader {
 	return nil
 }
 
-func TestPathConfArchiveControlCanBeUpdated(t *testing.T) {
+func TestPathConfCameraEventCanBeUpdated(t *testing.T) {
 	oldConf := &conf.Path{
-		ArchiveControlUUID: "8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021",
+		CameraEventSEIUUID: "8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021",
 	}
 	newConf := oldConf.Clone()
-	newConf.ArchiveControl = true
-	newConf.ArchiveControlUUID = "11111111-2222-4333-8444-555555555555"
-	newConf.ArchiveControlMaxAge = conf.Duration(30 * time.Second)
-	newConf.ArchiveControlMinRestartInterval = conf.Duration(2 * time.Second)
+	newConf.CameraEventServiceURL = "http://events:8080"
+	newConf.CameraEventSEIUUID = "11111111-2222-4333-8444-555555555555"
+	newConf.CameraEventRequestTimeout = conf.Duration(2 * time.Second)
 
 	require.True(t, pathConfCanBeUpdated(oldConf, newConf))
 }

@@ -45,51 +45,50 @@ func TestConfFromFile(t *testing.T) {
 		pa, ok := conf.Paths["cam1"]
 		require.Equal(t, true, ok)
 		require.Equal(t, &Path{
-			Name:                             "cam1",
-			Source:                           "publisher",
-			SourceOnDemandStartTimeout:       10 * Duration(time.Second),
-			SourceOnDemandCloseAfter:         10 * Duration(time.Second),
-			OverridePublisher:                true,
-			Forward:                          Forward{},
-			AlwaysAvailableTracks:            []AlwaysAvailableTrack{},
-			AlwaysAvailableRecorded:          true,
-			RecordPath:                       "./recordings/%path/%Y-%m-%d_%H-%M-%S-%f_%z",
-			RecordFormat:                     RecordFormatFMP4,
-			RecordPartDuration:               Duration(1 * time.Second),
-			RecordMaxPartSize:                50 * 1024 * 1024,
-			RecordSegmentDuration:            3600000000000,
-			RecordDeleteAfter:                86400000000000,
-			ArchiveControlUUID:               "8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021",
-			ArchiveControlMaxAge:             5 * Duration(time.Minute),
-			ArchiveControlMinRestartInterval: Duration(time.Second),
-			RTSPUDPSourcePortRange:           []uint{32768, 60999},
-			MoQTransport:                     MoQTransportQUIC,
-			WHEPSTUNGatherTimeout:            5 * Duration(time.Second),
-			WHEPHandshakeTimeout:             10 * Duration(time.Second),
-			WHEPTrackGatherTimeout:           2 * Duration(time.Second),
-			RPICameraWidth:                   1920,
-			RPICameraHeight:                  1080,
-			RPICameraContrast:                1,
-			RPICameraSaturation:              1,
-			RPICameraSharpness:               1,
-			RPICameraExposure:                "normal",
-			RPICameraAWB:                     "auto",
-			RPICameraAWBGains:                []float64{0, 0},
-			RPICameraDenoise:                 "off",
-			RPICameraMetering:                "centre",
-			RPICameraFPS:                     30,
-			RPICameraAfMode:                  "continuous",
-			RPICameraAfRange:                 "normal",
-			RPICameraAfSpeed:                 "normal",
-			RPICameraTextOverlay:             "%Y-%m-%d %H:%M:%S - MediaMTX",
-			RPICameraCodec:                   "auto",
-			RPICameraIDRPeriod:               60,
-			RPICameraBitrate:                 5000000,
-			RPICameraH264Profile:             "auto",
-			RPICameraH264Level:               "4.1",
-			RPICameraMJPEGQuality:            60,
-			RunOnDemandStartTimeout:          5 * Duration(time.Second),
-			RunOnDemandCloseAfter:            10 * Duration(time.Second),
+			Name:                       "cam1",
+			Source:                     "publisher",
+			SourceOnDemandStartTimeout: 10 * Duration(time.Second),
+			SourceOnDemandCloseAfter:   10 * Duration(time.Second),
+			OverridePublisher:          true,
+			Forward:                    Forward{},
+			AlwaysAvailableTracks:      []AlwaysAvailableTrack{},
+			AlwaysAvailableRecorded:    true,
+			RecordPath:                 "./recordings/%path/%Y-%m-%d_%H-%M-%S-%f_%z",
+			RecordFormat:               RecordFormatFMP4,
+			RecordPartDuration:         Duration(1 * time.Second),
+			RecordMaxPartSize:          50 * 1024 * 1024,
+			RecordSegmentDuration:      3600000000000,
+			RecordDeleteAfter:          86400000000000,
+			CameraEventSEIUUID:         "8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021",
+			CameraEventRequestTimeout:  5 * Duration(time.Second),
+			RTSPUDPSourcePortRange:     []uint{32768, 60999},
+			MoQTransport:               MoQTransportQUIC,
+			WHEPSTUNGatherTimeout:      5 * Duration(time.Second),
+			WHEPHandshakeTimeout:       10 * Duration(time.Second),
+			WHEPTrackGatherTimeout:     2 * Duration(time.Second),
+			RPICameraWidth:             1920,
+			RPICameraHeight:            1080,
+			RPICameraContrast:          1,
+			RPICameraSaturation:        1,
+			RPICameraSharpness:         1,
+			RPICameraExposure:          "normal",
+			RPICameraAWB:               "auto",
+			RPICameraAWBGains:          []float64{0, 0},
+			RPICameraDenoise:           "off",
+			RPICameraMetering:          "centre",
+			RPICameraFPS:               30,
+			RPICameraAfMode:            "continuous",
+			RPICameraAfRange:           "normal",
+			RPICameraAfSpeed:           "normal",
+			RPICameraTextOverlay:       "%Y-%m-%d %H:%M:%S - MediaMTX",
+			RPICameraCodec:             "auto",
+			RPICameraIDRPeriod:         60,
+			RPICameraBitrate:           5000000,
+			RPICameraH264Profile:       "auto",
+			RPICameraH264Level:         "4.1",
+			RPICameraMJPEGQuality:      60,
+			RunOnDemandStartTimeout:    5 * Duration(time.Second),
+			RunOnDemandCloseAfter:      10 * Duration(time.Second),
 		}, pa)
 	})
 
@@ -199,9 +198,10 @@ func TestConfFromFileAndEnv(t *testing.T) {
 	t.Setenv("RTSP_PROTOCOLS", "tcp")
 
 	// path parameter
+	t.Setenv("MTX_PATHDEFAULTS_CAMERAEVENTSERVICEURL", "https://default-events:8443")
 	t.Setenv("MTX_PATHS_CAM1_SOURCE", "rtsp://testing")
-	t.Setenv("MTX_PATHS_CAM1_ARCHIVECONTROL", "true")
-	t.Setenv("MTX_PATHS_CAM1_ARCHIVECONTROLMAXAGE", "30s")
+	t.Setenv("MTX_PATHS_CAM1_CAMERAEVENTSERVICEURL", "http://events:8080")
+	t.Setenv("MTX_PATHS_CAM1_CAMERAEVENTREQUESTTIMEOUT", "3s")
 
 	// deprecated global parameter
 	t.Setenv("MTX_RTMPDISABLE", "yes")
@@ -221,12 +221,13 @@ func TestConfFromFileAndEnv(t *testing.T) {
 	pa, ok := conf.Paths["cam1"]
 	require.Equal(t, true, ok)
 	require.Equal(t, "rtsp://testing", pa.Source)
-	require.True(t, pa.ArchiveControl)
-	require.Equal(t, 30*Duration(time.Second), pa.ArchiveControlMaxAge)
+	require.Equal(t, "http://events:8080", pa.CameraEventServiceURL)
+	require.Equal(t, 3*Duration(time.Second), pa.CameraEventRequestTimeout)
 
 	pa, ok = conf.Paths["cam2"]
 	require.Equal(t, true, ok)
 	require.Equal(t, false, pa.OverridePublisher)
+	require.Equal(t, "https://default-events:8443", pa.CameraEventServiceURL)
 }
 
 func TestConfFromEnv(t *testing.T) {
@@ -690,32 +691,32 @@ func TestConfErrors(t *testing.T) {
 			`'recordDeleteAfter' cannot be lower than 'recordSegmentDuration'`,
 		},
 		{
-			"invalid archive control UUID",
+			"invalid camera event UUID",
 			"paths:\n" +
 				"  my_path:\n" +
-				"    archiveControlUUID: invalid\n",
-			`'archiveControlUUID' must be a valid non-zero UUID`,
+				"    cameraEventSEIUUID: invalid\n",
+			`'cameraEventSEIUUID' must be a valid non-zero UUID`,
 		},
 		{
-			"zero archive control UUID",
+			"zero camera event UUID",
 			"paths:\n" +
 				"  my_path:\n" +
-				"    archiveControlUUID: 00000000-0000-0000-0000-000000000000\n",
-			`'archiveControlUUID' must be a valid non-zero UUID`,
+				"    cameraEventSEIUUID: 00000000-0000-0000-0000-000000000000\n",
+			`'cameraEventSEIUUID' must be a valid non-zero UUID`,
 		},
 		{
-			"negative archive control max age",
+			"invalid camera event timeout",
 			"paths:\n" +
 				"  my_path:\n" +
-				"    archiveControlMaxAge: -1s\n",
-			`'archiveControlMaxAge' cannot be negative`,
+				"    cameraEventRequestTimeout: 0s\n",
+			`'cameraEventRequestTimeout' must be greater than zero`,
 		},
 		{
-			"negative archive control restart interval",
+			"invalid camera event service URL",
 			"paths:\n" +
 				"  my_path:\n" +
-				"    archiveControlMinRestartInterval: -1s\n",
-			`'archiveControlMinRestartInterval' cannot be negative`,
+				"    cameraEventServiceURL: ftp://events\n",
+			`'cameraEventServiceURL' must be a valid HTTP or HTTPS URL`,
 		},
 		{
 			"missing rtpAddress with UDP and no encryption",

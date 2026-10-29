@@ -1,10 +1,13 @@
-FROM golang:1.27-alpine3.24 AS build
+FROM golang:1.27-alpine3.24 AS deps
 
 RUN apk add --no-cache git
 
 WORKDIR /s
 COPY go.mod go.sum ./
 RUN go mod download
+
+FROM deps AS build
+
 COPY . ./
 
 RUN go generate ./...

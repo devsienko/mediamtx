@@ -18,7 +18,7 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/pmp4"
 	"github.com/google/uuid"
 
-	"github.com/bluenviron/mediamtx/internal/archivecontrol"
+	"github.com/bluenviron/mediamtx/internal/cameraevent"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -241,18 +241,17 @@ type Path struct {
 	Forward Forward `json:"forward"`
 
 	// Record
-	Record                           bool         `json:"record"`
-	Playback                         *bool        `json:"playback,omitempty" deprecated:"true"`
-	RecordPath                       string       `json:"recordPath"`
-	RecordFormat                     RecordFormat `json:"recordFormat"`
-	RecordPartDuration               Duration     `json:"recordPartDuration"`
-	RecordMaxPartSize                StringSize   `json:"recordMaxPartSize"`
-	RecordSegmentDuration            Duration     `json:"recordSegmentDuration"`
-	RecordDeleteAfter                Duration     `json:"recordDeleteAfter"`
-	ArchiveControl                   bool         `json:"archiveControl"`
-	ArchiveControlUUID               string       `json:"archiveControlUUID"`
-	ArchiveControlMaxAge             Duration     `json:"archiveControlMaxAge"`
-	ArchiveControlMinRestartInterval Duration     `json:"archiveControlMinRestartInterval"`
+	Record                    bool         `json:"record"`
+	Playback                  *bool        `json:"playback,omitempty" deprecated:"true"`
+	RecordPath                string       `json:"recordPath"`
+	RecordFormat              RecordFormat `json:"recordFormat"`
+	RecordPartDuration        Duration     `json:"recordPartDuration"`
+	RecordMaxPartSize         StringSize   `json:"recordMaxPartSize"`
+	RecordSegmentDuration     Duration     `json:"recordSegmentDuration"`
+	RecordDeleteAfter         Duration     `json:"recordDeleteAfter"`
+	CameraEventServiceURL     string       `json:"cameraEventServiceURL"`
+	CameraEventSEIUUID        string       `json:"cameraEventSEIUUID"`
+	CameraEventRequestTimeout Duration     `json:"cameraEventRequestTimeout"`
 
 	// Authentication (deprecated)
 	PublishUser *Credential `json:"publishUser,omitempty" deprecated:"true"`
@@ -394,9 +393,8 @@ func (pconf *Path) setDefaults() {
 	pconf.RecordMaxPartSize = 50 * 1024 * 1024
 	pconf.RecordSegmentDuration = 3600 * Duration(time.Second)
 	pconf.RecordDeleteAfter = 24 * 3600 * Duration(time.Second)
-	pconf.ArchiveControlUUID = archivecontrol.DefaultUUID
-	pconf.ArchiveControlMaxAge = 5 * Duration(time.Minute)
-	pconf.ArchiveControlMinRestartInterval = Duration(time.Second)
+	pconf.CameraEventSEIUUID = cameraevent.DefaultUUID
+	pconf.CameraEventRequestTimeout = 5 * Duration(time.Second)
 
 	// Publisher source
 	pconf.OverridePublisher = true
@@ -915,17 +913,20 @@ func (pconf *Path) validate(
 		return fmt.Errorf("'recordDeleteAfter' cannot be lower than 'recordSegmentDuration'")
 	}
 
-	archiveControlUUID, err := uuid.Parse(pconf.ArchiveControlUUID)
-	if err != nil || archiveControlUUID == uuid.Nil {
-		return fmt.Errorf("'archiveControlUUID' must be a valid non-zero UUID")
+	cameraEventUUID, err := uuid.Parse(pconf.CameraEventSEIUUID)
+	if err != nil || cameraEventUUID == uuid.Nil {
+		return fmt.Errorf("'cameraEventSEIUUID' must be a valid non-zero UUID")
 	}
 
-	if pconf.ArchiveControlMaxAge < 0 {
-		return fmt.Errorf("'archiveControlMaxAge' cannot be negative")
+	if pconf.CameraEventRequestTimeout <= 0 {
+		return fmt.Errorf("'cameraEventRequestTimeout' must be greater than zero")
 	}
 
-	if pconf.ArchiveControlMinRestartInterval < 0 {
-		return fmt.Errorf("'archiveControlMinRestartInterval' cannot be negative")
+	if pconf.CameraEventServiceURL != "" {
+		_, err := cameraevent.ServiceEndpoint(pconf.CameraEventServiceURL)
+		if err != nil {
+			return fmt.Errorf("'cameraEventServiceURL' %w", err)
+		}
 	}
 
 	// Authentication (deprecated)

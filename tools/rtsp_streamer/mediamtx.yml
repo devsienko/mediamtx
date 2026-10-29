@@ -1,11 +1,6 @@
 paths:
   test:
-    # Only trusted publishers on this path can control recording through H264 SEI.
-    archiveControl: true
-    archiveControlUUID: 8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021
-    archiveControlMaxAge: 5m
-    archiveControlMinRestartInterval: 1s
-
-    # The directory is configured even when recording is currently stopped.
-    recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f_%z
-    recordDeleteAfter: 0s
+    # MediaMTX sends POST http://127.0.0.1:8080/camera-event.
+    cameraEventServiceURL: http://127.0.0.1:8080
+    cameraEventSEIUUID: 8f3f2f78-90b8-4f6e-a6d8-5f627bb8d021
+    cameraEventRequestTimeout: 5s
